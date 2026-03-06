@@ -3,9 +3,12 @@
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+
 from app.auth import verify_api_key
 from app.routers import analytics, interactions, items, learners, pipeline
 from app.settings import settings
+
+
 
 app = FastAPI(
     title=settings.app_name,

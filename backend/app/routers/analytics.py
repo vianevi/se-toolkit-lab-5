@@ -1,90 +1,247 @@
-"""Router for analytics endpoints.
-
-Each endpoint performs SQL aggregation queries on the interaction data
-populated by the ETL pipeline. All endpoints require a `lab` query
-parameter to filter results by lab (e.g., "lab-01").
-"""
-
 from fastapi import APIRouter, Depends, Query
+from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.database import get_session
+from app.models.item import ItemRecord
+from app.models.learner import Learner
+from app.models.interaction import InteractionLog
 
 router = APIRouter()
 
 
-@router.get("/scores")
-async def get_scores(
-    lab: str = Query(..., description="Lab identifier, e.g. 'lab-01'"),
-    session: AsyncSession = Depends(get_session),
-):
-    """Score distribution histogram for a given lab.
-
-    TODO: Implement this endpoint.
-    - Find the lab item by matching title (e.g. "lab-04" → title contains "Lab 04")
-    - Find all tasks that belong to this lab (parent_id = lab.id)
-    - Query interactions for these items that have a score
-    - Group scores into buckets: "0-25", "26-50", "51-75", "76-100"
-      using CASE WHEN expressions
-    - Return a JSON array:
-      [{"bucket": "0-25", "count": 12}, {"bucket": "26-50", "count": 8}, ...]
-    - Always return all four buckets, even if count is 0
+def _normalize_lab_pattern(lab: str) -> str:
+    """Normalize lab identifier for matching against titles.
+    
+    Converts 'lab-04' to 'lab 04' pattern for matching.
     """
-    raise NotImplementedError
+    # Replace hyphens with spaces for matching
+    return lab.replace("-", " ")
+
+
+@router.get("/scores")
+async def get_scores_histogram(
+    lab: str = Query(..., description="Lab identifier, e.g. lab-04"),
+    session: AsyncSession = Depends(get_session)
+):
+    """Returns distribution of scores in four buckets."""
+    # Find lab by title pattern
+    lab_pattern = _normalize_lab_pattern(lab)
+    lab_result = await session.exec(
+        select(ItemRecord).where(
+            ItemRecord.type == "lab",
+            ItemRecord.title.ilike(f"%{lab_pattern}%")
+        )
+    )
+    lab_record = lab_result.first()
+
+    if not lab_record:
+        return [{"bucket": b, "count": 0} for b in ["0-25", "26-50", "51-75", "76-100"]]
+
+    lab_id = lab_record.id
+
+    # Find all tasks under this lab
+    tasks_result = await session.exec(
+        select(ItemRecord.id).where(
+            ItemRecord.parent_id == lab_id,
+            ItemRecord.type == "task"
+        )
+    )
+    task_ids = list(tasks_result)
+
+    if not task_ids:
+        return [{"bucket": b, "count": 0} for b in ["0-25", "26-50", "51-75", "76-100"]]
+
+    # Get all interactions for these tasks with non-null scores
+    interactions_result = await session.exec(
+        select(InteractionLog.score).where(
+            InteractionLog.item_id.in_(task_ids),
+            InteractionLog.score.isnot(None)
+        )
+    )
+    scores = list(interactions_result)
+
+    # Count scores in each bucket
+    buckets = {"0-25": 0, "26-50": 0, "51-75": 0, "76-100": 0}
+    for score in scores:
+        if score <= 25:
+            buckets["0-25"] += 1
+        elif score <= 50:
+            buckets["26-50"] += 1
+        elif score <= 75:
+            buckets["51-75"] += 1
+        else:
+            buckets["76-100"] += 1
+
+    return [{"bucket": b, "count": buckets[b]} for b in ["0-25", "26-50", "51-75", "76-100"]]
 
 
 @router.get("/pass-rates")
 async def get_pass_rates(
-    lab: str = Query(..., description="Lab identifier, e.g. 'lab-01'"),
-    session: AsyncSession = Depends(get_session),
+    lab: str = Query(..., description="Lab identifier, e.g. lab-04"),
+    session: AsyncSession = Depends(get_session)
 ):
-    """Per-task pass rates for a given lab.
+    """Returns per-task statistics."""
+    # Find lab by title pattern
+    lab_pattern = _normalize_lab_pattern(lab)
+    lab_result = await session.exec(
+        select(ItemRecord).where(
+            ItemRecord.type == "lab",
+            ItemRecord.title.ilike(f"%{lab_pattern}%")
+        )
+    )
+    lab_record = lab_result.first()
 
-    TODO: Implement this endpoint.
-    - Find the lab item and its child task items
-    - For each task, compute:
-      - avg_score: average of interaction scores (round to 1 decimal)
-      - attempts: total number of interactions
-    - Return a JSON array:
-      [{"task": "Repository Setup", "avg_score": 92.3, "attempts": 150}, ...]
-    - Order by task title
-    """
-    raise NotImplementedError
+    if not lab_record:
+        return []
+
+    lab_id = lab_record.id
+
+    # Get all tasks under this lab
+    tasks_result = await session.exec(
+        select(ItemRecord).where(
+            ItemRecord.parent_id == lab_id,
+            ItemRecord.type == "task"
+        )
+    )
+    tasks = tasks_result.all()
+
+    result = []
+    for task in tasks:
+        # Get interactions for this task with non-null scores
+        interactions_result = await session.exec(
+            select(InteractionLog.score).where(
+                InteractionLog.item_id == task.id,
+                InteractionLog.score.isnot(None)
+            )
+        )
+        scores = list(interactions_result)
+
+        attempts = len(scores)
+        avg_score = round(sum(scores) / len(scores), 1) if scores else 0.0
+
+        result.append({
+            "task": task.title,
+            "avg_score": avg_score,
+            "attempts": attempts
+        })
+
+    return result
 
 
 @router.get("/timeline")
 async def get_timeline(
-    lab: str = Query(..., description="Lab identifier, e.g. 'lab-01'"),
-    session: AsyncSession = Depends(get_session),
+    lab: str = Query(..., description="Lab identifier, e.g. lab-04"),
+    session: AsyncSession = Depends(get_session)
 ):
-    """Submissions per day for a given lab.
+    """Returns submissions per day."""
+    # Find lab by title pattern
+    lab_pattern = _normalize_lab_pattern(lab)
+    lab_result = await session.exec(
+        select(ItemRecord).where(
+            ItemRecord.type == "lab",
+            ItemRecord.title.ilike(f"%{lab_pattern}%")
+        )
+    )
+    lab_record = lab_result.first()
 
-    TODO: Implement this endpoint.
-    - Find the lab item and its child task items
-    - Group interactions by date (use func.date(created_at))
-    - Count the number of submissions per day
-    - Return a JSON array:
-      [{"date": "2026-02-28", "submissions": 45}, ...]
-    - Order by date ascending
-    """
-    raise NotImplementedError
+    if not lab_record:
+        return []
+
+    lab_id = lab_record.id
+
+    # Find all tasks under this lab
+    tasks_result = await session.exec(
+        select(ItemRecord.id).where(
+            ItemRecord.parent_id == lab_id,
+            ItemRecord.type == "task"
+        )
+    )
+    task_ids = list(tasks_result)
+
+    if not task_ids:
+        return []
+
+    # Get all interactions for these tasks
+    interactions_result = await session.exec(
+        select(InteractionLog.created_at).where(
+            InteractionLog.item_id.in_(task_ids)
+        )
+    )
+    created_ats = list(interactions_result)
+
+    # Group by date
+    date_counts: dict[str, int] = {}
+    for created_at in created_ats:
+        date_str = created_at.strftime("%Y-%m-%d")
+        date_counts[date_str] = date_counts.get(date_str, 0) + 1
+
+    # Sort by date and return
+    sorted_dates = sorted(date_counts.keys())
+    return [{"date": d, "submissions": date_counts[d]} for d in sorted_dates]
 
 
 @router.get("/groups")
 async def get_groups(
-    lab: str = Query(..., description="Lab identifier, e.g. 'lab-01'"),
-    session: AsyncSession = Depends(get_session),
+    lab: str = Query(..., description="Lab identifier, e.g. lab-04"),
+    session: AsyncSession = Depends(get_session)
 ):
-    """Per-group performance for a given lab.
+    """Returns per-group performance."""
+    # Find lab by title pattern
+    lab_pattern = _normalize_lab_pattern(lab)
+    lab_result = await session.exec(
+        select(ItemRecord).where(
+            ItemRecord.type == "lab",
+            ItemRecord.title.ilike(f"%{lab_pattern}%")
+        )
+    )
+    lab_record = lab_result.first()
 
-    TODO: Implement this endpoint.
-    - Find the lab item and its child task items
-    - Join interactions with learners to get student_group
-    - For each group, compute:
-      - avg_score: average score (round to 1 decimal)
-      - students: count of distinct learners
-    - Return a JSON array:
-      [{"group": "B23-CS-01", "avg_score": 78.5, "students": 25}, ...]
-    - Order by group name
-    """
-    raise NotImplementedError
+    if not lab_record:
+        return []
+
+    lab_id = lab_record.id
+
+    # Find all tasks under this lab
+    tasks_result = await session.exec(
+        select(ItemRecord.id).where(
+            ItemRecord.parent_id == lab_id,
+            ItemRecord.type == "task"
+        )
+    )
+    task_ids = list(tasks_result)
+
+    if not task_ids:
+        return []
+
+    # Get all interactions with scores for these tasks, joined with learner info
+    interactions_result = await session.exec(
+        select(InteractionLog.score, Learner.student_group, Learner.id).join(
+            Learner, InteractionLog.learner_id == Learner.id
+        ).where(
+            InteractionLog.item_id.in_(task_ids),
+            InteractionLog.score.isnot(None)
+        )
+    )
+    rows = interactions_result.all()
+
+    # Group by student_group
+    group_data: dict[str, dict] = {}
+    for score, group, learner_id in rows:
+        if group not in group_data:
+            group_data[group] = {"scores": [], "learner_ids": set()}
+        group_data[group]["scores"].append(score)
+        group_data[group]["learner_ids"].add(learner_id)
+
+    result = []
+    for group, data in group_data.items():
+        avg_score = round(sum(data["scores"]) / len(data["scores"]), 1) if data["scores"] else 0.0
+        result.append({
+            "group": group,
+            "avg_score": avg_score,
+            "students": len(data["learner_ids"])
+        })
+
+    # Sort by group name
+    result.sort(key=lambda x: x["group"])
+    return result
